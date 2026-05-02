@@ -1,9 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
 import math
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
@@ -15,7 +9,6 @@ from torch.nn.init import trunc_normal_
 from torch.utils.checkpoint import checkpoint
 
 
-# ----------------------------------------------------------------------------
 def to_2tuple(x):
     if isinstance(x, (str, bytes)):
         return (x, x)
@@ -33,23 +26,45 @@ class RopePositionEmbedding(nn.Module):
         embed_dim: int,
         *,
         num_heads: int,
-        base: float | None = 100.0,
-        min_period: float | None = None,
-        max_period: float | None = None,
+        base: Optional[float] = 100.0,
+        min_period: Optional[float] = None,
+        max_period: Optional[float] = None,
         normalize_coords: Literal["min", "max", "separate"] = "separate",
-        shift_coords: float | None = None,
-        jitter_coords: float | None = None,
-        rescale_coords: float | None = None,
-        dtype: torch.dtype | None = None,
-        device: torch.device | None = None,
+        shift_coords: Optional[float] = None,
+        jitter_coords: Optional[float] = None,
+        rescale_coords: Optional[float] = None,
+        dtype: Optional[torch.dtype] = None,
+        device: Optional[torch.device] = None,
     ):
         super().__init__()
-        assert embed_dim % (4 * num_heads) == 0
+        if embed_dim <= 0:
+            raise ValueError("embed_dim must be positive")
+        if num_heads <= 0:
+            raise ValueError("num_heads must be positive")
+        if embed_dim % (4 * num_heads) != 0:
+            raise ValueError("embed_dim must be divisible by 4 * num_heads")
         both_periods = min_period is not None and max_period is not None
         if (base is None and not both_periods) or (base is not None and both_periods):
             raise ValueError(
                 "Either `base` or `min_period`+`max_period` must be provided."
             )
+        if base is not None and base <= 0:
+            raise ValueError("base must be positive")
+        if both_periods:
+            if min_period is None or max_period is None:
+                raise ValueError("min_period and max_period must both be provided")
+            if min_period <= 0 or max_period <= 0:
+                raise ValueError("min_period and max_period must be positive")
+            if max_period < min_period:
+                raise ValueError("max_period must be greater than or equal to min_period")
+        if normalize_coords not in ("min", "max", "separate"):
+            raise ValueError(f"Unknown normalize_coords: {normalize_coords}")
+        if shift_coords is not None and shift_coords < 0:
+            raise ValueError("shift_coords must be non-negative")
+        if jitter_coords is not None and jitter_coords < 1:
+            raise ValueError("jitter_coords must be greater than or equal to 1")
+        if rescale_coords is not None and rescale_coords < 1:
+            raise ValueError("rescale_coords must be greater than or equal to 1")
 
         D_head = embed_dim // num_heads
         self.base = base
@@ -60,9 +75,7 @@ class RopePositionEmbedding(nn.Module):
         self.shift_coords = shift_coords
         self.jitter_coords = jitter_coords
         self.rescale_coords = rescale_coords
-
-        # Needs persistent=True because we do teacher.load_state_dict(student.state_dict()) to initialize the teacher
-        self.dtype = dtype or torch.float32  # Don't rely on self.periods.dtype
+        self.dtype = dtype or torch.float32
         self.register_buffer(
             "periods",
             torch.empty(D_head // 4, device=device, dtype=self.dtype),
@@ -70,61 +83,58 @@ class RopePositionEmbedding(nn.Module):
         )
         self._init_weights()
 
-    def forward(self, *, H: int, W: int) -> tuple[Tensor, Tensor]:
+    def forward(self, *, H: int, W: int) -> Tuple[Tensor, Tensor]:
+        if H <= 0 or W <= 0:
+            raise ValueError("H and W must be positive")
         device = self.periods.device
         dtype = self.dtype
         dd = {"device": device, "dtype": dtype}
-        # Prepare coords in range [-1, +1]
         if self.normalize_coords == "max":
             max_HW = max(H, W)
-            coords_h = torch.arange(0.5, H, **dd) / max_HW  # [H]
-            coords_w = torch.arange(0.5, W, **dd) / max_HW  # [W]
+            coords_h = torch.arange(0.5, H, **dd) / max_HW
+            coords_w = torch.arange(0.5, W, **dd) / max_HW
         elif self.normalize_coords == "min":
             min_HW = min(H, W)
-            coords_h = torch.arange(0.5, H, **dd) / min_HW  # [H]
-            coords_w = torch.arange(0.5, W, **dd) / min_HW  # [W]
+            coords_h = torch.arange(0.5, H, **dd) / min_HW
+            coords_w = torch.arange(0.5, W, **dd) / min_HW
         elif self.normalize_coords == "separate":
-            coords_h = torch.arange(0.5, H, **dd) / H  # [H]
-            coords_w = torch.arange(0.5, W, **dd) / W  # [W]
+            coords_h = torch.arange(0.5, H, **dd) / H
+            coords_w = torch.arange(0.5, W, **dd) / W
         else:
             raise ValueError(f"Unknown normalize_coords: {self.normalize_coords}")
         coords = torch.stack(
             torch.meshgrid(coords_h, coords_w, indexing="ij"), dim=-1
-        )  # [H, W, 2]
-        coords = coords.flatten(0, 1)  # [HW, 2]
-        coords = 2.0 * coords - 1.0  # Shift range [0, 1] to [-1, +1]
+        )
+        coords = coords.flatten(0, 1)
+        coords = 2.0 * coords - 1.0
 
-        # Shift coords by adding a uniform value in [-shift, shift]
         if self.training and self.shift_coords is not None:
             shift_hw = torch.empty(2, **dd).uniform_(
                 -self.shift_coords, self.shift_coords
             )
-            coords += shift_hw[None, :]
+            coords = coords + shift_hw[None, :]
 
-        # Jitter coords by multiplying the range [-1, 1] by a log-uniform value in [1/jitter, jitter]
         if self.training and self.jitter_coords is not None:
-            jitter_max = np.log(self.jitter_coords)
+            jitter_max = math.log(float(self.jitter_coords))
             jitter_min = -jitter_max
             jitter_hw = torch.empty(2, **dd).uniform_(jitter_min, jitter_max).exp()
-            coords *= jitter_hw[None, :]
+            coords = coords * jitter_hw[None, :]
 
-        # Rescale coords by multiplying the range [-1, 1] by a log-uniform value in [1/rescale, rescale]
         if self.training and self.rescale_coords is not None:
-            rescale_max = np.log(self.rescale_coords)
+            rescale_max = math.log(float(self.rescale_coords))
             rescale_min = -rescale_max
             rescale_hw = torch.empty(1, **dd).uniform_(rescale_min, rescale_max).exp()
-            coords *= rescale_hw
+            coords = coords * rescale_hw
 
-        # Prepare angles and sin/cos
         angles = (
             2 * math.pi * coords[:, :, None] / self.periods[None, None, :]
-        )  # [HW, 2, D//4]
-        angles = angles.flatten(1, 2)  # [HW, D//2]
-        angles = angles.tile(2)  # [HW, D]
-        cos = torch.cos(angles)  # [HW, D]
-        sin = torch.sin(angles)  # [HW, D]
+        )
+        angles = angles.flatten(1, 2)
+        angles = angles.repeat(1, 2)
+        cos = torch.cos(angles)
+        sin = torch.sin(angles)
 
-        return (sin, cos)  # 2 * [HW, D]
+        return sin, cos
 
     def _init_weights(self):
         device = self.periods.device
@@ -134,23 +144,20 @@ class RopePositionEmbedding(nn.Module):
                 2
                 * torch.arange(self.D_head // 4, device=device, dtype=dtype)
                 / (self.D_head // 2)
-            )  # [D//4]
+            )
         else:
+            if self.min_period is None or self.max_period is None:
+                raise ValueError("min_period and max_period must both be provided")
             base = self.max_period / self.min_period
             exponents = torch.linspace(
                 0, 1, self.D_head // 4, device=device, dtype=dtype
-            )  # [D//4] range [0, 1]
-            periods = base**exponents  # range [1, max_period / min_period]
-            periods = periods / base  # range [min_period / max_period, 1]
-            periods = periods * self.max_period  # range [min_period, max_period]
-        self.periods.data = periods
+            )
+            periods = self.min_period * (base**exponents)
+        with torch.no_grad():
+            self.periods.copy_(periods)
 
 
-# -------------------------------------------------------------------------------
 class Tokenizer(nn.Module):
-    """Stacked window self‑attention that emits one token per window
-    by re‑using TransformerEncoderLayer blocks."""
-
     def __init__(
         self,
         embed_dims: int,
@@ -159,25 +166,31 @@ class Tokenizer(nn.Module):
         num_tokenizer_layers: int = 1,
         qkv_bias: bool = True,
         use_qk_norm: bool = False,
-        chunk_size: int = 1024,  # max windows per chunk
+        chunk_size: int = 1024,
     ):
         super().__init__()
+        if embed_dims <= 0:
+            raise ValueError("embed_dims must be positive")
+        if window_size <= 0:
+            raise ValueError("window_size must be positive")
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        if num_tokenizer_layers < 0:
+            raise ValueError("num_tokenizer_layers must be non-negative")
         self.ws = window_size
         self.chunk_size = chunk_size
 
-        # local absolute positional embeddings for [CLS] + patch tokens
         self.local_pos_embed = nn.Parameter(
             torch.zeros(1, 1 + window_size * window_size, embed_dims)
         )
         trunc_normal_(self.local_pos_embed, std=0.02)
 
-        # build N identical TransformerEncoderLayer blocks
         self.blocks = nn.ModuleList(
             [
                 TransformerEncoderLayer2(
                     embed_dims=embed_dims,
                     num_heads=num_heads,
-                    feedforward_channels=embed_dims * 4,  # standard FFN size
+                    feedforward_channels=embed_dims * 4,
                     qkv_bias=qkv_bias,
                     use_qk_norm=use_qk_norm,
                 )
@@ -185,7 +198,6 @@ class Tokenizer(nn.Module):
             ]
         )
 
-        # shared CLS token for pooling
         self.w_cls = nn.Parameter(torch.zeros(1, 1, embed_dims))
         trunc_normal_(self.w_cls, std=0.02)
 
@@ -194,28 +206,25 @@ class Tokenizer(nn.Module):
         x: torch.Tensor,
         hw: Tuple[int, int],
     ) -> Tuple[torch.Tensor, Tuple[int, int]]:
-        """Args:
-           x  : B, N, C   (N = H*W)
-           hw : (H, W) before reduction
-        Returns:
-           x_ : B, (H/ws)*(W/ws), C
-           hw_: (H/ws, W/ws)
-        """
+        if x.dim() != 3:
+            raise ValueError("x must have shape (B, N, C)")
         B, N, C = x.shape
         H, W = hw
         ws = self.ws
-        assert H % ws == 0 and W % ws == 0, (
-            f"Image size {H}×{W} must be divisible by window {ws}."
-        )
+        if H <= 0 or W <= 0:
+            raise ValueError("H and W must be positive")
+        if N != H * W:
+            raise ValueError("N must equal H * W")
+        if H % ws != 0 or W % ws != 0:
+            raise ValueError(f"Image size {H}×{W} must be divisible by window {ws}.")
 
-        # reshape tokens → non‑overlapping windows
         x = x.view(B, H, W, C)
 
-        ph, pw = H // ws, W // ws  ## ints in eager mode
-        ph, pw = int(ph), int(pw)  ## ints in scripting mode
-        x = x.view(B, ph, ws, pw, ws, C)  # B, H/ws, ws, W/ws, ws, C
-        x = x.permute(0, 1, 3, 2, 4, 5)  # B, H/ws, W/ws, ws, ws, C
-        x = x.contiguous().view(B * ph * pw, ws * ws, C)  # (B*H/ws*W/ws), ws², C))
+        ph, pw = H // ws, W // ws
+        ph, pw = int(ph), int(pw)
+        x = x.view(B, ph, ws, pw, ws, C)
+        x = x.permute(0, 1, 3, 2, 4, 5)
+        x = x.contiguous().view(B * ph * pw, ws * ws, C)
 
         total_windows = x.size(0)
         chunk_size = int(min(self.chunk_size, total_windows))
@@ -229,24 +238,23 @@ class Tokenizer(nn.Module):
             return t
 
         for i in range(0, total_windows, chunk_size):
-            chunk = x[i : i + chunk_size]  # (m, ws², C)
+            chunk = x[i : i + chunk_size]
             m = chunk.size(0)
-            cls = self.w_cls.expand(m, -1, -1)  # (m, 1, C)
-            chunk = torch.cat([cls, chunk], dim=1)  # (m, 1+ws², C)
-            chunk = chunk + self.local_pos_embed  # add local PE
+            cls = self.w_cls.expand(m, -1, -1)
+            chunk = torch.cat([cls, chunk], dim=1)
+            chunk = chunk + self.local_pos_embed
 
             if use_ckpt:
                 chunk = checkpoint(_run_blocks, chunk, use_reentrant=False)
             else:
                 chunk = _run_blocks(chunk)
 
-            token_out[i : i + m] = chunk[:, 0]  # take CLS out
+            token_out[i : i + m] = chunk[:, 0]
 
-        token = token_out.view(B, ph * pw, C)  # (B, (H/ws)*(W
+        token = token_out.view(B, ph * pw, C)
         return token, (ph, pw)
 
 
-# -------------------------------------------------------------------------------
 class GroupedQueryAttention(nn.Module):
     def __init__(
         self,
@@ -264,30 +272,35 @@ class GroupedQueryAttention(nn.Module):
         layer_scale_init_value=0.0,
     ):
         super().__init__()
-        # Core dims
+        if embed_dims <= 0:
+            raise ValueError("embed_dims must be positive")
+        if num_heads <= 0:
+            raise ValueError("num_heads must be positive")
+        if embed_dims % num_heads != 0:
+            raise ValueError("embed_dims must be divisible by num_heads")
         self.embed_dims = embed_dims
         self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads or num_heads
-        assert self.num_heads % self.num_kv_heads == 0, (
-            "num_kv_heads must divide num_heads"
-        )
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        if self.num_kv_heads <= 0:
+            raise ValueError("num_kv_heads must be positive")
+        if self.num_heads % self.num_kv_heads != 0:
+            raise ValueError("num_kv_heads must divide num_heads")
         self.head_dim = embed_dims // num_heads
-        self.input_dims = input_dims or embed_dims
-        # Features
-        self.attn_drop = attn_drop
+        self.input_dims = input_dims if input_dims is not None else embed_dims
+        if self.input_dims <= 0:
+            raise ValueError("input_dims must be positive")
+        if not 0.0 <= attn_drop <= 1.0:
+            raise ValueError("attn_drop must be between 0 and 1")
+        if not 0.0 <= proj_drop <= 1.0:
+            raise ValueError("proj_drop must be between 0 and 1")
+        if qk_scale is not None and qk_scale <= 0:
+            raise ValueError("qk_scale must be positive")
+        self.attn_drop = float(attn_drop)
+        self.qk_scale = qk_scale
         self.v_shortcut = v_shortcut
         self.use_qk_norm = use_qk_norm
-
-        # Attention operation selection
-        if qk_scale is not None:
-            scale = qk_scale
-        else:
-            scale = self.head_dim**-0.5
-
-        assert qk_scale is None, "qk_scale is not supported"
         self.attn_op = F.scaled_dot_product_attention
 
-        # Q/K/V projections
         self.wq = nn.Linear(self.input_dims, embed_dims, bias=qkv_bias)
         self.wk = nn.Linear(
             self.input_dims, self.num_kv_heads * self.head_dim, bias=qkv_bias
@@ -300,60 +313,65 @@ class GroupedQueryAttention(nn.Module):
             self.q_norm = nn.RMSNorm(self.head_dim, eps=1e-6)
             self.k_norm = nn.RMSNorm(self.head_dim, eps=1e-6)
 
-        # Output projection + dropout
         self.proj = nn.Linear(embed_dims, embed_dims, bias=proj_bias)
         self.proj_drop = nn.Dropout(proj_drop)
 
-        # Optional LayerScale
         if layer_scale_init_value > 0:
             self.gamma = LayerScale(embed_dims, scale=layer_scale_init_value)
         else:
             self.gamma = nn.Identity()
 
     def apply_rope(
-        self, q: Tensor, k: Tensor, rope: Tensor | Tuple[Tensor, Tensor]
+        self, q: Tensor, k: Tensor, rope: Tuple[Tensor, Tensor]
     ) -> Tuple[Tensor, Tensor]:
-        # All operations will use the dtype of rope, the output is cast back to the dtype of q and k
+        if len(rope) != 2:
+            raise ValueError("rope must contain sin and cos tensors")
+        sin, cos = rope
+        if sin.shape != cos.shape:
+            raise ValueError("sin and cos must have the same shape")
+        if q.shape[-1] != k.shape[-1]:
+            raise ValueError("q and k must have the same head dimension")
+        if q.shape[-1] != sin.shape[-1]:
+            raise ValueError("rope head dimension must match q and k head dimension")
+        if q.shape[-1] % 2 != 0:
+            raise ValueError("rope head dimension must be even")
         q_dtype = q.dtype
         k_dtype = k.dtype
-        sin, cos = rope
         rope_dtype = sin.dtype
         q = q.to(dtype=rope_dtype)
         k = k.to(dtype=rope_dtype)
-        N = q.shape[-2]
-        prefix = N - sin.shape[-2]  ## extra tokens
-        assert prefix >= 0
-        q_prefix = q[:, :, :prefix, :]
-        q = self._rope_apply(q[:, :, prefix:, :], sin, cos)  # [B, head, hw, D//head]
-        q = torch.cat((q_prefix, q), dim=-2)  # [B, head, N, D//head]
-        k_prefix = k[:, :, :prefix, :]
-        k = self._rope_apply(k[:, :, prefix:, :], sin, cos)  # [B, head, hw, D//head]
-        k = torch.cat((k_prefix, k), dim=-2)  # [B, head, N, D//head]
+        rope_len = sin.shape[-2]
+        q_prefix_len = q.shape[-2] - rope_len
+        k_prefix_len = k.shape[-2] - rope_len
+        if q_prefix_len < 0 or k_prefix_len < 0:
+            raise ValueError("rope sequence length cannot exceed q or k sequence length")
+        q_prefix = q[:, :, :q_prefix_len, :]
+        q = self._rope_apply(q[:, :, q_prefix_len:, :], sin, cos)
+        q = torch.cat((q_prefix, q), dim=-2)
+        k_prefix = k[:, :, :k_prefix_len, :]
+        k = self._rope_apply(k[:, :, k_prefix_len:, :], sin, cos)
+        k = torch.cat((k_prefix, k), dim=-2)
         q = q.to(dtype=q_dtype)
         k = k.to(dtype=k_dtype)
         return q, k
 
     def _rope_rotate_half(self, x: Tensor) -> Tensor:
-        # x:   [ x0  x1  x2  x3  x4  x5]
-        # out: [-x3 -x4 -x5  x0  x1  x2]
         x1, x2 = x.chunk(2, dim=-1)
         return torch.cat([-x2, x1], dim=-1)
 
     def _rope_apply(self, x: Tensor, sin: Tensor, cos: Tensor) -> Tensor:
-        # x:   [..., D], eg [x0,     x1,   x2,   x3,   x4,   x5]
-        # sin: [..., D], eg [sin0, sin1, sin2, sin0, sin1, sin2]
-        # cos: [..., D], eg [cos0, cos1, cos2, cos0, cos1, cos2]
         return (x * cos) + (self._rope_rotate_half(x) * sin)
 
     def forward(self, x, rope=None):
-        B, N, _ = x.shape
-        # Q: (B, N, num_heads, head_dim)
+        if x.dim() != 3:
+            raise ValueError("x must have shape (B, N, C)")
+        B, N, C = x.shape
+        if C != self.input_dims:
+            raise ValueError("x last dimension must match input_dims")
         q = self.wq(x).view(B, N, self.num_heads, self.head_dim)
-        # K/V: (B, N, num_kv_heads, head_dim)
         k = self.wk(x).view(B, N, self.num_kv_heads, self.head_dim)
         v = self.wv(x).view(B, N, self.num_kv_heads, self.head_dim)
 
-        # (B, heads, N, head_dim)
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
@@ -362,7 +380,6 @@ class GroupedQueryAttention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-        # Repeat KV heads if group ratio >1
         if self.num_kv_heads != self.num_heads:
             factor = self.num_heads // self.num_kv_heads
             k = k.repeat_interleave(factor, dim=1)
@@ -371,25 +388,24 @@ class GroupedQueryAttention(nn.Module):
         if rope is not None:
             q, k = self.apply_rope(q, k, rope)
 
-        # Scaled dot-product attention
-        attn_out = self.attn_op(
-            q, k, v, dropout_p=self.attn_drop if self.training else 0.0
-        )  # (B, num_heads, N, head_dim)
+        dropout_p = self.attn_drop if self.training else 0.0
+        if self.qk_scale is None:
+            attn_out = self.attn_op(q, k, v, dropout_p=dropout_p)
+        else:
+            attn_out = self.attn_op(q, k, v, dropout_p=dropout_p, scale=self.qk_scale)
 
-        # Merge heads -> (B, N, embed_dims)
         out = attn_out.permute(0, 2, 1, 3).reshape(B, N, self.embed_dims)
 
-        # Output projection + drop + layer scale
+        if self.v_shortcut:
+            v_out = v.permute(0, 2, 1, 3).reshape(B, N, self.embed_dims)
+            out = out + v_out
+
         out = self.proj(out)
         out = self.gamma(self.proj_drop(out))
 
-        # Optional V-shortcut (only when MQA)
-        if self.v_shortcut and self.num_kv_heads == 1:
-            raise NotImplementedError
         return out
 
 
-# -------------------------------------------------------------------------------
 class TransformerEncoderLayer2(nn.Module):
     def __init__(
         self,
@@ -422,6 +438,7 @@ class TransformerEncoderLayer2(nn.Module):
         self.ffn = SwiGLUFFN(
             embed_dims=embed_dims,
             feedforward_channels=feedforward_channels,
+            layer_scale_init_value=layer_scale_init_value,
         )
 
     @property
@@ -438,7 +455,6 @@ class TransformerEncoderLayer2(nn.Module):
         return x
 
 
-##-----------------------------------
 class Sapiens2(nn.Module):
     arch_zoo = {
         **dict.fromkeys(
@@ -493,7 +509,7 @@ class Sapiens2(nn.Module):
         ),
     }
 
-    num_extra_tokens = 1  # class token
+    num_extra_tokens = 1
     OUT_TYPES = {"raw", "cls_token", "featmap"}
 
     def __init__(
@@ -505,48 +521,53 @@ class Sapiens2(nn.Module):
         out_indices=-1,
         drop_rate=0.0,
         window_size=4,
-        use_tokenizer=False,  ## 4k resolution
+        use_tokenizer=False,
         use_qk_norm=True,
         qkv_bias=True,
         final_norm=True,
         out_type="raw",
         with_cls_token=True,
-        layer_scale_init_value=1e-4,  ## non zero init to activate layerscale
+        layer_scale_init_value=1e-4,
         frozen_stages=-1,
-        patch_cfg=dict(),
-        layer_cfgs=dict(),
-        pos_embed_rope_base: float = 100.0,
-        pos_embed_rope_min_period: float | None = None,
-        pos_embed_rope_max_period: float | None = None,
+        patch_cfg: Optional[Dict[str, Any]] = None,
+        layer_cfgs: Optional[Union[Dict[str, Any], Sequence[Dict[str, Any]]]] = None,
+        pos_embed_rope_base: Optional[float] = 100.0,
+        pos_embed_rope_min_period: Optional[float] = None,
+        pos_embed_rope_max_period: Optional[float] = None,
         pos_embed_rope_normalize_coords: Literal["min", "max", "separate"] = "separate",
-        pos_embed_rope_shift_coords: float | None = None,
-        pos_embed_rope_jitter_coords: float | None = None,
-        pos_embed_rope_rescale_coords: float | None = None,
+        pos_embed_rope_shift_coords: Optional[float] = None,
+        pos_embed_rope_jitter_coords: Optional[float] = None,
+        pos_embed_rope_rescale_coords: Optional[float] = None,
         pos_embed_rope_dtype: str = "bf16",
         n_storage_tokens: int = 8,
     ):
         super().__init__()
 
+        if not isinstance(arch, str):
+            raise TypeError("arch must be a string")
         arch = arch.lower()
-        assert arch in set(self.arch_zoo), (
-            f"Arch {arch} is not in default archs {set(self.arch_zoo)}"
-        )
+        if arch not in set(self.arch_zoo):
+            raise ValueError(f"Arch {arch} is not in default archs {set(self.arch_zoo)}")
         self.arch_settings = self.arch_zoo[arch]
+
+        if window_size <= 0:
+            raise ValueError("window_size must be positive")
+        patch_size_tuple = to_2tuple(patch_size)
+        if patch_size_tuple[0] <= 0 or patch_size_tuple[1] <= 0:
+            raise ValueError("patch_size must be positive")
+        img_size = to_2tuple(img_size)
+        if img_size[0] <= 0 or img_size[1] <= 0:
+            raise ValueError("img_size must be positive")
+        if frozen_stages < -1 or frozen_stages > self.arch_settings["num_layers"]:
+            raise ValueError("frozen_stages must be between -1 and num_layers")
 
         self.embed_dims = self.arch_settings["embed_dims"]
         self.num_layers = self.arch_settings["num_layers"]
         self.patch_size = patch_size
-
         self.window_size = window_size
-        img_size = to_2tuple(img_size)
-        encoder_img_size = (
-            (img_size[0] // window_size, img_size[1] // window_size)
-            if use_tokenizer
-            else img_size
-        )
-        self.img_size = to_2tuple(encoder_img_size)
+        self.img_size = img_size
 
-        # Set patch embedding
+        patch_cfg = dict(patch_cfg or {})
         _patch_cfg = dict(
             in_channels=in_channels,
             input_size=self.img_size,
@@ -557,8 +578,32 @@ class Sapiens2(nn.Module):
         )
         _patch_cfg.update(patch_cfg)
         self.patch_embed = PatchEmbed(**_patch_cfg)
-        self.patch_resolution = self.patch_embed.init_out_size
-        num_patches = self.patch_resolution[0] * self.patch_resolution[1]
+        if self.patch_embed.init_out_size is None:
+            raise ValueError("PatchEmbed requires a known input_size")
+        patch_embed_resolution = self.patch_embed.init_out_size
+        if use_tokenizer:
+            if (
+                patch_embed_resolution[0] % window_size != 0
+                or patch_embed_resolution[1] % window_size != 0
+            ):
+                raise ValueError(
+                    "Patch resolution must be divisible by window_size when use_tokenizer=True"
+                )
+            self.patch_resolution = (
+                patch_embed_resolution[0] // window_size,
+                patch_embed_resolution[1] // window_size,
+            )
+        else:
+            self.patch_resolution = patch_embed_resolution
+
+        if pos_embed_rope_dtype in ("bf16", "bfloat16"):
+            rope_dtype = torch.bfloat16
+        elif pos_embed_rope_dtype in ("fp32", "float32"):
+            rope_dtype = torch.float32
+        elif pos_embed_rope_dtype in (torch.bfloat16, torch.float32):
+            rope_dtype = pos_embed_rope_dtype
+        else:
+            raise ValueError("pos_embed_rope_dtype must be 'bf16' or 'float32'")
 
         self.rope_embed = RopePositionEmbedding(
             embed_dim=self.embed_dims,
@@ -570,30 +615,27 @@ class Sapiens2(nn.Module):
             shift_coords=pos_embed_rope_shift_coords,
             jitter_coords=pos_embed_rope_jitter_coords,
             rescale_coords=pos_embed_rope_rescale_coords,
-            dtype=torch.bfloat16 if pos_embed_rope_dtype == "bf16" else torch.float32,
+            dtype=rope_dtype,
         )
 
-        # Set out type
         if out_type not in self.OUT_TYPES:
             raise ValueError(
-                f"Unsupported `out_type` {out_type}, please "
-                f"choose from {self.OUT_TYPES}"
+                f"Unsupported `out_type` {out_type}, please choose from {self.OUT_TYPES}"
             )
         self.out_type = out_type
 
-        if use_tokenizer == True:
+        if use_tokenizer:
             self.tokenizer = Tokenizer(
                 embed_dims=self.embed_dims,
                 window_size=self.window_size,
                 num_heads=self.arch_settings["num_heads"],
                 num_tokenizer_layers=self.arch_settings["num_tokenizer_layers"],
-                qkv_bias=True,
+                qkv_bias=qkv_bias,
                 use_qk_norm=False,
             )
         else:
             self.tokenizer = None
 
-        # Set cls + storage tokens
         self.with_cls_token = with_cls_token
         if with_cls_token:
             self.cls_token = nn.Parameter(torch.zeros(1, 1, self.embed_dims))
@@ -603,41 +645,56 @@ class Sapiens2(nn.Module):
         else:
             raise ValueError('with_cls_token must be True when `out_type="cls_token"`.')
 
-        ## registers
         self.n_storage_tokens = int(n_storage_tokens)
+        if self.n_storage_tokens < 0:
+            raise ValueError("n_storage_tokens must be non-negative")
         self.storage_tokens = (
             nn.Parameter(torch.zeros(1, self.n_storage_tokens, self.embed_dims))
             if self.n_storage_tokens > 0
             else None
         )
-        # how many non-patch tokens are at the front
         self.num_extra_tokens = (
             1 if self.cls_token is not None else 0
         ) + self.n_storage_tokens
 
         if isinstance(out_indices, int):
             out_indices = [out_indices]
-        assert isinstance(out_indices, Sequence), (
-            f'"out_indices" must by a sequence or int, get {type(out_indices)} instead.'
-        )
-        for i, index in enumerate(out_indices):
-            if index < 0:
-                out_indices[i] = self.num_layers + index
-            assert 0 <= out_indices[i] <= self.num_layers, (
-                f"Invalid out_indices {index}"
+        elif isinstance(out_indices, Sequence) and not isinstance(out_indices, (str, bytes)):
+            out_indices = list(out_indices)
+        else:
+            raise TypeError(
+                f'"out_indices" must be a sequence or int, got {type(out_indices)} instead.'
             )
-        self.out_indices = out_indices
+        normalized_out_indices = []
+        for index in out_indices:
+            if not isinstance(index, int):
+                raise TypeError("All out_indices entries must be integers")
+            original_index = index
+            if index < 0:
+                index = self.num_layers + index
+            if not 0 <= index < self.num_layers:
+                raise ValueError(f"Invalid out_indices {original_index}")
+            normalized_out_indices.append(index)
+        self.out_indices = tuple(normalized_out_indices)
 
-        self.blocks = nn.Sequential()
+        self.blocks = nn.ModuleList()
+        if layer_cfgs is None:
+            layer_cfgs = {}
         if isinstance(layer_cfgs, dict):
-            layer_cfgs = [layer_cfgs] * self.num_layers
+            layer_cfgs = [dict(layer_cfgs) for _ in range(self.num_layers)]
+        else:
+            if not isinstance(layer_cfgs, Sequence) or isinstance(layer_cfgs, (str, bytes)):
+                raise TypeError("layer_cfgs must be a dict or a sequence of dicts")
+            if len(layer_cfgs) != self.num_layers:
+                raise ValueError("layer_cfgs length must match num_layers")
+            layer_cfgs = [dict(layer_cfg or {}) for layer_cfg in layer_cfgs]
 
         mhsa_early, mhsa_late = 8, 8
         for i in range(self.num_layers):
             if i < mhsa_early or i >= self.num_layers - mhsa_late:
-                num_kv_heads = None  ## use MHSA
+                num_kv_heads = None
             else:
-                num_kv_heads = self.arch_settings["num_heads"] // 2  # Use GQA
+                num_kv_heads = self.arch_settings["num_heads"] // 2
 
             _layer_cfg = dict(
                 embed_dims=self.embed_dims,
@@ -653,89 +710,80 @@ class Sapiens2(nn.Module):
             self.blocks.append(TransformerEncoderLayer2(**_layer_cfg))
 
         self.frozen_stages = frozen_stages
-
         self.final_norm = final_norm
-        if final_norm:
-            self.ln1 = nn.RMSNorm(self.embed_dims, eps=1e-6)
+        self.ln1 = nn.RMSNorm(self.embed_dims, eps=1e-6) if final_norm else nn.Identity()
 
-        # freeze stages only when self.frozen_stages > 0
+        self.init_weights()
+
         if self.frozen_stages > 0:
             self._freeze_stages()
 
-        ## load init weights
-        self.init_weights()
-
-        return
-
     def init_weights(self):
-        # Initialize class token and storagr token embeddings
         if self.with_cls_token:
             trunc_normal_(self.cls_token, std=0.02)
 
         if self.storage_tokens is not None:
             trunc_normal_(self.storage_tokens, std=0.02)
 
-        # Apply custom initialization to all submodules
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            # Use a truncated normal distribution for linear layer weights
             trunc_normal_(m.weight, std=0.02)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
         elif isinstance(m, (nn.LayerNorm, nn.RMSNorm)):
-            # Initialize normalization layers to act as an identity function
             if hasattr(m, "bias") and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
             if hasattr(m, "weight") and m.weight is not None:
                 nn.init.constant_(m.weight, 1.0)
 
         elif isinstance(m, nn.Conv2d):
-            # Initialize conv layer weights like linear layers
             trunc_normal_(m.weight, std=0.02)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
     def _freeze_stages(self):
-        ## freeze tokenizer
         if self.frozen_stages >= 1 and self.tokenizer is not None:
             self.tokenizer.eval()
             for param in self.tokenizer.parameters():
                 param.requires_grad = False
 
-        # freeze patch embedding
         self.patch_embed.eval()
         for param in self.patch_embed.parameters():
             param.requires_grad = False
-        # freeze cls_token
+
         if self.cls_token is not None:
-            self.cls_token.requires_grad = False
+            self.cls_token.requires_grad_(False)
         if self.storage_tokens is not None:
-            self.storage_tokens.requires_grad = False
-        # freeze layers
+            self.storage_tokens.requires_grad_(False)
+
         for i in range(1, self.frozen_stages + 1):
             m = self.blocks[i - 1]
             m.eval()
             for param in m.parameters():
                 param.requires_grad = False
 
-        # freeze the last layer norm
         if self.frozen_stages == len(self.blocks):
             if self.final_norm:
                 self.ln1.eval()
                 for param in self.ln1.parameters():
                     param.requires_grad = False
 
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if mode and self.frozen_stages > 0:
+            self._freeze_stages()
+        return self
+
     def forward(self, x):
         B = x.shape[0]
 
-        x, patch_resolution = self.patch_embed(x)  # (B, 256*256, C)
+        x, patch_resolution = self.patch_embed(x)
         if self.tokenizer is not None:
             x, patch_resolution = self.tokenizer(x, patch_resolution)
 
-        # prepend [CLS] and storage tokens
         prepend = []
         if self.cls_token is not None:
             prepend.append(self.cls_token.expand(B, -1, -1))
@@ -766,15 +814,14 @@ class Sapiens2(nn.Module):
         patch_token = x[:, self.num_extra_tokens :]
         if self.out_type == "featmap":
             B = x.size(0)
-            # (B, N, C) -> (B, H, W, C) -> (B, C, H, W)
             return patch_token.reshape(B, *hw, -1).permute(0, 3, 1, 2)
+        raise RuntimeError(f"Unsupported out_type {self.out_type}")
 
     @property
     def norm1(self):
         return self.ln1
 
 
-# ----------------------------------------------------------------------------
 class LayerScale(nn.Module):
     def __init__(
         self,
@@ -784,10 +831,11 @@ class LayerScale(nn.Module):
         scale: float = 1e-5,
     ):
         super().__init__()
-        assert data_format in (
+        if data_format not in (
             "channels_last",
             "channels_first",
-        ), "'data_format' could only be channels_last or channels_first."
+        ):
+            raise ValueError("'data_format' could only be channels_last or channels_first.")
         self.inplace = inplace
         self.data_format = data_format
         self.weight = nn.Parameter(torch.ones(dim) * scale)
@@ -803,7 +851,45 @@ class LayerScale(nn.Module):
             return x * self.weight.view(*shape)
 
 
-# ----------------------------------------------------------------------------
+class AdaptivePadding(nn.Module):
+    def __init__(self, kernel_size=1, stride=1, dilation=1, padding="corner"):
+        super().__init__()
+        if padding not in ("same", "corner"):
+            raise ValueError("padding must be 'same' or 'corner'")
+        self.kernel_size = to_2tuple(kernel_size)
+        self.stride = to_2tuple(stride)
+        self.dilation = to_2tuple(dilation)
+        self.padding = padding
+
+    def get_pad_shape(self, input_shape):
+        input_h, input_w = input_shape
+        kernel_h, kernel_w = self.kernel_size
+        stride_h, stride_w = self.stride
+        dilation_h, dilation_w = self.dilation
+        output_h = math.ceil(input_h / stride_h)
+        output_w = math.ceil(input_w / stride_w)
+        pad_h = max((output_h - 1) * stride_h + (kernel_h - 1) * dilation_h + 1 - input_h, 0)
+        pad_w = max((output_w - 1) * stride_w + (kernel_w - 1) * dilation_w + 1 - input_w, 0)
+        return pad_h, pad_w
+
+    def forward(self, x):
+        pad_h, pad_w = self.get_pad_shape(x.shape[-2:])
+        if pad_h > 0 or pad_w > 0:
+            if self.padding == "corner":
+                x = F.pad(x, [0, pad_w, 0, pad_h])
+            else:
+                x = F.pad(
+                    x,
+                    [
+                        pad_w // 2,
+                        pad_w - pad_w // 2,
+                        pad_h // 2,
+                        pad_h - pad_h // 2,
+                    ],
+                )
+        return x
+
+
 class PatchEmbed(nn.Module):
     def __init__(
         self,
@@ -825,46 +911,67 @@ class PatchEmbed(nn.Module):
         kernel_size = to_2tuple(kernel_size)
         stride = to_2tuple(stride)
         dilation = to_2tuple(dilation)
-        padding = 0
-        padding = to_2tuple(padding)
+        if isinstance(padding, str):
+            self.adaptive_padding = AdaptivePadding(
+                kernel_size=kernel_size,
+                stride=stride,
+                dilation=dilation,
+                padding=padding,
+            )
+            conv_padding = (0, 0)
+        else:
+            self.adaptive_padding = None
+            conv_padding = to_2tuple(padding)
 
         self.projection = nn.Conv2d(
             in_channels=in_channels,
             out_channels=embed_dims,
             kernel_size=kernel_size,
             stride=stride,
-            padding=padding,
+            padding=conv_padding,
             dilation=dilation,
             bias=bias,
         )
 
-        if input_size:
+        if input_size is not None:
             input_size = to_2tuple(input_size)
             self.init_input_size = input_size
-            h_out = (
-                input_size[0] + 2 * padding[0] - dilation[0] * (kernel_size[0] - 1) - 1
-            ) // stride[0] + 1
-            w_out = (
-                input_size[1] + 2 * padding[1] - dilation[1] * (kernel_size[1] - 1) - 1
-            ) // stride[1] + 1
+            if self.adaptive_padding is not None:
+                pad_h, pad_w = self.adaptive_padding.get_pad_shape(input_size)
+                h_out = (
+                    input_size[0] + pad_h - dilation[0] * (kernel_size[0] - 1) - 1
+                ) // stride[0] + 1
+                w_out = (
+                    input_size[1] + pad_w - dilation[1] * (kernel_size[1] - 1) - 1
+                ) // stride[1] + 1
+            else:
+                h_out = (
+                    input_size[0]
+                    + 2 * conv_padding[0]
+                    - dilation[0] * (kernel_size[0] - 1)
+                    - 1
+                ) // stride[0] + 1
+                w_out = (
+                    input_size[1]
+                    + 2 * conv_padding[1]
+                    - dilation[1] * (kernel_size[1] - 1)
+                    - 1
+                ) // stride[1] + 1
             self.init_out_size = (h_out, w_out)
         else:
             self.init_input_size = None
             self.init_out_size = None
 
     def forward(self, x):
+        if self.adaptive_padding is not None:
+            x = self.adaptive_padding(x)
         x = self.projection(x)
         out_size = (x.shape[2], x.shape[3])
         x = x.flatten(2).transpose(1, 2)
         return x, out_size
 
 
-# ----------------------------------------------------------------------------
 class SwiGLUFFN(nn.Module):
-    """SwiGLU FFN layer.
-    https://github.com/facebookresearch/dinov2/blob/main/dinov2/layers/swiglu_ffn.py
-    """  # noqa
-
     def __init__(
         self,
         embed_dims: int,
@@ -875,6 +982,12 @@ class SwiGLUFFN(nn.Module):
         add_identity: bool = True,
     ) -> None:
         super().__init__()
+        if embed_dims <= 0:
+            raise ValueError("embed_dims must be positive")
+        if feedforward_channels is not None and feedforward_channels <= 0:
+            raise ValueError("feedforward_channels must be positive")
+        if out_dims is not None and out_dims <= 0:
+            raise ValueError("out_dims must be positive")
         self.embed_dims = embed_dims
         self.out_dims = out_dims or embed_dims
         hidden_dims = feedforward_channels or embed_dims
@@ -883,7 +996,7 @@ class SwiGLUFFN(nn.Module):
         self.w3 = nn.Linear(hidden_dims, self.out_dims, bias=bias)
 
         if layer_scale_init_value > 0:
-            self.gamma2 = LayerScale(dim=embed_dims, scale=layer_scale_init_value)
+            self.gamma2 = LayerScale(dim=self.out_dims, scale=layer_scale_init_value)
         else:
             self.gamma2 = nn.Identity()
 
@@ -899,8 +1012,6 @@ class SwiGLUFFN(nn.Module):
         out = self.gamma2(out)
 
         if self.out_dims != self.embed_dims or not self.add_identity:
-            # due to the dimension inconsistence or user setting
-            # not to apply residual operation
             return out
 
         if identity is None:
